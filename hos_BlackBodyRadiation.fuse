@@ -1,0 +1,200 @@
+--[[
+    Black Body Radiation Fuse by Sven Neve / House of Secrets
+
+    Based on the work and code of Hugo Elias et al.
+    http://freespace.virgin.net/hugo.elias/models/m_ffire.htm
+
+    This is pretty much a 1 on 1 conversion (with the exception of the gamma correction);
+    A lot of this code can be optimized.
+    
+    
+    
+    The MIT License (MIT)
+
+    Copyright (c) 2015 Sven Neve
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+    
+--]]
+
+FuRegisterClass("hos_BlackBodyRadiation", CT_Tool, {
+    REGS_Name = "Black Body Radiation",
+    REGS_Category = "House of Secrets\\Color",
+    REGS_OpIconString = "HBBR",
+    REGS_OpDescription = "Black Body Radiation Fuse",
+    })
+
+
+clsource =
+[[
+
+float3 Expose(float3 light, float exposure)
+{
+    return ( 1.0f - exp(light * exposure) );
+}
+  
+kernel void ToolTemplate(   FuReadImage_t inimg,
+                            FuWriteImage_t outimg,
+                            const int4 datawindow,
+                            float mintemp,
+                            float maxtemp,
+                            float exposure,
+                            float gamma)
+{
+    const int2 ipos = (int2)(get_global_id(1), get_global_id(0)) + datawindow.xy;
+    const int2 size = datawindow.zw;
+    
+    const float h = 6.626f * pow(10.0f, -34.0f);                // Planck's Constant in Js
+    const float c = 3.0f * pow(10.0f, 8.0f);                    // Speed Of Light in m/s
+    const float k = 1.380f * pow(10.0f, -23.0f);                // Boltzmann Constant in J/K
+        
+    const float red_wave = 0.7f * pow(10.0f, -6.0f);            // red wavelength in nm
+    const float green_wave = 0.56f * pow(10.0f, -6.0f);         // green wavelength in nm
+    const float blue_wave = 0.47f * pow(10.0f, -6.0f);          // blue wavelength in nm
+    
+    float4 img = FuReadImagef(inimg, ipos, size);
+    float Y = 0.2126f*img.x + 0.7152f*img.y + 0.0722f*img.z;    // RGB to Relative Luminance
+    float T = mix(mintemp, maxtemp, Y);// Temperature in Kelvin
+    float3 L = (float3)(red_wave, green_wave, blue_wave);
+    L = pow(L, 5.0f) * (exp((h * c)/(k * T * L))*-1.0f);
+    L = pow(10.0f,-28.0f) / L;
+    
+    float3 result = Expose(L, exposure);                        // Clamps values to 1.0, maybe not desirable in Fusion.
+    
+    // Not sure converting to 2.2 is correct, added it anyway.
+    result = pow(result, gamma);// * img.w;
+
+    FuWriteImagef(outimg, ipos, size, (float4)(result, img.w));
+}
+]]
+
+function Create()
+    InImage = self:AddInput("Image", "Image", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+        })
+        
+    InMinTemp = self:AddInput("Min Temperature", "MinTemperature", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0,
+        })
+        
+    InMaxTemp = self:AddInput("Min Temperature", "MaxTemperature", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 5740,
+        })
+        
+    InExposure = self:AddInput("Exposure", "Exposure", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 100,
+        })
+        
+    InGamma = self:AddInput("Gamma", "Gamma", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 2.2,
+        INP_MinAllowed = 0.0000001
+        })
+        
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+        })                
+
+    mgr = OCLManager()
+    if mgr then
+        prog = mgr:BuildCachedProgram(self.RegNode, clsource)
+    end
+end
+
+-- function OnAddToFlow()
+    -- mgr = OCLManager()
+    -- if mgr then
+        -- local path = string.sub(debug.getinfo(1).source, 2)
+        -- prog = mgr:BuildCachedProgram("SourceTemplate", path, clsource)
+    -- end
+-- end
+
+function Process(req) 
+    local mintemp = InMinTemp:GetValue(req).Value
+    local maxtemp = InMaxTemp:GetValue(req).Value
+    local exposure = InExposure:GetValue(req).Value
+    local gamma = InGamma:GetValue(req).Value
+    local inimg = InImage:GetValue(req)
+    local img = Image{ IMG_Like = inimg }
+    local out
+
+    if img and prog then
+        local incl = prog:CreateImage(inimg, "read")
+        local outcl = prog:CreateImage(img, "write")
+        if incl and outcl then
+            -- create image
+            local kernel = prog:CreateKernel("ToolTemplate")
+
+            if kernel then
+                prog:SetArg(kernel, 0, incl)
+                prog:SetArg(kernel, 1, outcl)
+                prog:SetArgInt(kernel, 2, img.DataWindow[1], img.DataWindow[2], img.DataWindow[3] - img.DataWindow[1], img.DataWindow[4] - img.DataWindow[2])
+                prog:SetArg(kernel, 3, mintemp)
+                prog:SetArg(kernel, 4, maxtemp)
+                prog:SetArg(kernel, 5, exposure)
+                prog:SetArg(kernel, 6, 1/gamma)
+                --prog:SetWorkgroupSize(64) // No idea what the beef with Nvidia OpenCL is, but workgroups and sizes always blow up when i use 'm.
+
+                prog:RunKernel(kernel)
+                if self.Status then
+                    prog:Download(outcl, img)
+                    out = img
+                end
+            end
+        end
+        if incl then
+            incl:ReleaseCLObject()
+        end
+        if outcl then
+            outcl:ReleaseCLObject()
+        end
+    end
+    
+    -- if prog and not success then        -- failed? may need to build a new context
+        -- prog = nil
+        -- mgr = nil
+        -- collectgarbage()                -- force cleanup now
+
+        -- mgr = OCLManager()
+        -- if mgr then
+            -- -- local path = string.sub(debug.getinfo(1).source, 2)
+            -- -- prog = mgr:BuildCachedProgram("Fuse.OpenCLSample", path, clsource)
+            --prog = mgr:BuildCachedProgram(self.RegNode, clsource)
+        -- end
+    -- end
+    
+    
+    -- local te = TimeExtent()
+    -- if seetherate > 0.0 then
+        -- te = TimeExtent(req.Time, req.Time, TIME_UNDEFINED)
+    -- end
+
+    -- req:SetOutputData(OutImage, out, te)
+    
+    OutImage:Set(req, out)
+end
